@@ -149,6 +149,59 @@ class FcmService {
   static StreamSubscription<RemoteMessage>? _openSub;
   static StreamSubscription<RemoteMessage>? _foregroundSub;
 
+  // iOS can need a short moment after permission is granted before APNs
+  // gives Firebase a device token. We never block login or show that
+  // temporary state as an error to the user; we retry quietly in background.
+  static Timer? _apnsRetryTimer;
+  static int _apnsRetryAttempt = 0;
+  static const int _maxApnsRetryAttempts = 12;
+
+  static bool get _isIos =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+
+  static void _scheduleTokenRetry() {
+    if (!_isIos || _apnsRetryAttempt >= _maxApnsRetryAttempts) return;
+    if (_apnsRetryTimer?.isActive == true) return;
+
+    _apnsRetryTimer = Timer(const Duration(seconds: 1), () {
+      _apnsRetryTimer = null;
+      _apnsRetryAttempt++;
+      unawaited(syncCurrentSessionToken());
+    });
+  }
+
+  static Future<String?> _getTokenSafely({
+    bool scheduleRetry = true,
+  }) async {
+    try {
+      if (_isIos) {
+        final apnsToken = await FirebaseMessaging.instance.getAPNSToken();
+
+        if (apnsToken == null || apnsToken.isEmpty) {
+          if (scheduleRetry) _scheduleTokenRetry();
+          return null;
+        }
+      }
+
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token == null || token.isEmpty) {
+        if (scheduleRetry) _scheduleTokenRetry();
+        return null;
+      }
+
+      _apnsRetryAttempt = 0;
+      _apnsRetryTimer?.cancel();
+      _apnsRetryTimer = null;
+      return token;
+    } catch (e) {
+      // APNs/FCM may still be warming up on iOS. Keep the app smooth and
+      // retry in the background instead of surfacing a technical error.
+      debugPrint('FCM TOKEN WAIT: $e');
+      if (scheduleRetry) _scheduleTokenRetry();
+      return null;
+    }
+  }
+
   static Future<void> initialize() async {
     FirebaseMessaging.onBackgroundMessage(
       firebaseMessagingBackgroundHandler,
@@ -162,7 +215,10 @@ class FcmService {
 
     _tokenSub?.cancel();
     _tokenSub = FirebaseMessaging.instance.onTokenRefresh.listen(
-      (_) => syncCurrentSessionToken(),
+      (_) {
+        _apnsRetryAttempt = 0;
+        unawaited(syncCurrentSessionToken());
+      },
     );
 
     _openSub?.cancel();
@@ -193,6 +249,10 @@ class FcmService {
         );
       },
     );
+
+    // Existing sessions should get their token as soon as APNs is ready,
+    // without delaying the first screen.
+    unawaited(syncCurrentSessionToken());
   }
 
   static Future<void> syncCurrentSessionToken() async {
@@ -214,7 +274,7 @@ class FcmService {
   }) async {
     if (role.isEmpty || userId.isEmpty) return;
 
-    final token = await FirebaseMessaging.instance.getToken();
+    final token = await _getTokenSafely();
     if (token == null || token.isEmpty) return;
 
     final collection =
@@ -256,7 +316,7 @@ class FcmService {
 
     if (role.isEmpty || userId.isEmpty) return;
 
-    final token = await FirebaseMessaging.instance.getToken();
+    final token = await _getTokenSafely(scheduleRetry: false);
     if (token == null || token.isEmpty) return;
 
     final collection =
