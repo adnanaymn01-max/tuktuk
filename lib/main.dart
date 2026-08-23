@@ -50,6 +50,59 @@ bool get supabaseConfigured =>
     supabasePublishableKey.isNotEmpty &&
     !supabasePublishableKey.contains('PASTE_');
 
+
+// ============================================================
+// DRIVER REFERRAL / INVITE SETTINGS
+// ============================================================
+const int driverReferralRequiredRides = 3;
+const int driverReferralRewardIqd = 1000;
+
+String compactPlaceName(String raw) {
+  final value = raw.trim();
+  if (value.isEmpty) return '';
+
+  final parts = value
+      .split(RegExp(r'[,،]'))
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
+
+  bool isPlusCode(String v) =>
+      RegExp(
+        r'^[A-Z0-9]{4,}\+[A-Z0-9]{2,}$',
+        caseSensitive: false,
+      ).hasMatch(v);
+
+  for (final part in parts) {
+    if (isPlusCode(part)) continue;
+    if (part == 'العراق' ||
+        part == 'محافظة بغداد' ||
+        part == 'بغداد') {
+      continue;
+    }
+    return part;
+  }
+
+  return value;
+}
+
+bool placeNeedsAreaLookup(String raw) {
+  final value = raw.trim();
+  if (value.isEmpty) return true;
+
+  final first =
+      value.split(RegExp(r'[,،]')).first.trim();
+
+  final plusCode = RegExp(
+    r'^[A-Z0-9]{4,}\+[A-Z0-9]{2,}$',
+    caseSensitive: false,
+  ).hasMatch(first);
+
+  return plusCode ||
+      value.contains('محافظة بغداد') ||
+      value.endsWith('العراق');
+}
+
 Future<void> logoutUser(BuildContext context) async {
   await FcmService.removeCurrentSessionToken();
 
@@ -1590,6 +1643,799 @@ class RewardsPage extends StatelessWidget {
   }
 }
 
+
+class DriverReferralService {
+  static String buildInviteCode(
+    String driverId,
+  ) {
+    final clean = driverId
+        .replaceAll(
+          RegExp(r'[^A-Za-z0-9]'),
+          '',
+        )
+        .toUpperCase();
+
+    final suffix =
+        clean.length > 6
+            ? clean.substring(
+                clean.length - 6,
+              )
+            : clean;
+
+    return 'DRV$suffix';
+  }
+
+  static Future<String>
+      ensureInviteCode(
+    String driverId,
+  ) async {
+    final ref = FirebaseFirestore
+        .instance
+        .collection('drivers')
+        .doc(driverId);
+
+    final snap = await ref.get();
+
+    if (!snap.exists) return '';
+
+    final current = stringValue(
+      snap.data()?['inviteCode'],
+    ).trim();
+
+    if (current.isNotEmpty) {
+      return current;
+    }
+
+    final code =
+        buildInviteCode(driverId);
+
+    await ref.set({
+      'inviteCode': code,
+      'inviteCodeUpdatedAt':
+          FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+
+    return code;
+  }
+
+  static Future<String>
+      findInviterIdByCode(
+    String rawCode,
+  ) async {
+    final code =
+        rawCode.trim().toUpperCase();
+
+    if (code.isEmpty) return '';
+
+    final snap = await FirebaseFirestore
+        .instance
+        .collection('drivers')
+        .where(
+          'inviteCode',
+          isEqualTo: code,
+        )
+        .limit(1)
+        .get();
+
+    if (snap.docs.isEmpty) {
+      throw Exception(
+        'كود الدعوة غير صحيح',
+      );
+    }
+
+    return snap.docs.first.id;
+  }
+
+  static Future<void>
+      createPendingReferral({
+    required String inviterDriverId,
+    required String referredDriverId,
+    required String code,
+  }) async {
+    if (inviterDriverId.isEmpty ||
+        referredDriverId.isEmpty ||
+        inviterDriverId ==
+            referredDriverId) {
+      return;
+    }
+
+    await FirebaseFirestore.instance
+        .collection('driver_referrals')
+        .doc(referredDriverId)
+        .set({
+      'inviterDriverId':
+          inviterDriverId,
+      'referredDriverId':
+          referredDriverId,
+      'code':
+          code.trim().toUpperCase(),
+      'requiredRides':
+          driverReferralRequiredRides,
+      'rewardAmount':
+          driverReferralRewardIqd,
+      'completedRides': 0,
+      'status': 'pending',
+      'createdAt':
+          FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  static Future<void>
+      recordCompletedRide({
+    required String rideId,
+    required String referredDriverId,
+  }) async {
+    final referralRef =
+        FirebaseFirestore.instance
+            .collection(
+              'driver_referrals',
+            )
+            .doc(referredDriverId);
+
+    final rideRef =
+        FirebaseFirestore.instance
+            .collection(
+              'ride_requests',
+            )
+            .doc(rideId);
+
+    final rewardTxRef =
+        FirebaseFirestore.instance
+            .collection(
+              'driver_balance_transactions',
+            )
+            .doc();
+
+    String rewardedInviterId = '';
+
+    await FirebaseFirestore.instance
+        .runTransaction(
+      (transaction) async {
+        final rideSnap =
+            await transaction.get(
+          rideRef,
+        );
+
+        if (!rideSnap.exists) return;
+
+        final rideData =
+            rideSnap.data()!;
+
+        if (rideData[
+                'referralRideCounted'] ==
+            true) {
+          return;
+        }
+
+        final referralSnap =
+            await transaction.get(
+          referralRef,
+        );
+
+        if (!referralSnap.exists) {
+          return;
+        }
+
+        final referral =
+            referralSnap.data()!;
+
+        final status =
+            stringValue(
+          referral['status'],
+        );
+
+        if (status == 'rewarded' ||
+            status == 'canceled') {
+          transaction.update(
+            rideRef,
+            {
+              'referralRideCounted':
+                  true,
+            },
+          );
+          return;
+        }
+
+        final inviterId =
+            stringValue(
+          referral[
+              'inviterDriverId'],
+        );
+
+        if (inviterId.isEmpty) {
+          return;
+        }
+
+        final inviterRef =
+            FirebaseFirestore
+                .instance
+                .collection('drivers')
+                .doc(inviterId);
+
+        final inviterSnap =
+            await transaction.get(
+          inviterRef,
+        );
+
+        if (!inviterSnap.exists) {
+          return;
+        }
+
+        final savedRequired =
+            intValue(
+          referral[
+              'requiredRides'],
+        );
+
+        final savedReward =
+            intValue(
+          referral[
+              'rewardAmount'],
+        );
+
+        final required =
+            savedRequired > 0
+                ? savedRequired
+                : driverReferralRequiredRides;
+
+        final reward =
+            savedReward > 0
+                ? savedReward
+                : driverReferralRewardIqd;
+
+        final newCompleted =
+            intValue(
+                  referral[
+                      'completedRides'],
+                ) +
+                1;
+
+        transaction.update(
+          rideRef,
+          {
+            'referralRideCounted':
+                true,
+          },
+        );
+
+        if (newCompleted >=
+            required) {
+          final oldBalance =
+              intValue(
+            inviterSnap
+                .data()?['balance'],
+          );
+
+          final newBalance =
+              oldBalance + reward;
+
+          transaction.update(
+            inviterRef,
+            {
+              'balance': newBalance,
+              'balanceUpdatedAt':
+                  FieldValue
+                      .serverTimestamp(),
+            },
+          );
+
+          transaction.update(
+            referralRef,
+            {
+              'completedRides':
+                  newCompleted,
+              'status': 'rewarded',
+              'rewardedAt':
+                  FieldValue
+                      .serverTimestamp(),
+            },
+          );
+
+          transaction.set(
+            rewardTxRef,
+            {
+              'driverId': inviterId,
+              'type':
+                  'referral_reward',
+              'amount': reward,
+              'balanceBefore':
+                  oldBalance,
+              'balanceAfter':
+                  newBalance,
+              'referredDriverId':
+                  referredDriverId,
+              'rideId': rideId,
+              'createdAt':
+                  FieldValue
+                      .serverTimestamp(),
+            },
+          );
+
+          rewardedInviterId =
+              inviterId;
+        } else {
+          transaction.update(
+            referralRef,
+            {
+              'completedRides':
+                  newCompleted,
+              'updatedAt':
+                  FieldValue
+                      .serverTimestamp(),
+            },
+          );
+        }
+      },
+    );
+
+    if (rewardedInviterId
+        .isNotEmpty) {
+      await FirebaseFirestore.instance
+          .collection(
+            'app_notifications',
+          )
+          .add({
+        'targetType': 'driver',
+        'targetId':
+            rewardedInviterId,
+        'type': 'reward',
+        'title':
+            'وصلتك مكافأة دعوة 🎁',
+        'body':
+            'صديقك كمل $driverReferralRequiredRides رحلات. تمت إضافة $driverReferralRewardIqd د.ع إلى رصيدك.',
+        'readBy': <String>[],
+        'createdAt':
+            FieldValue
+                .serverTimestamp(),
+      });
+
+      await ExternalPushService
+          .sendToUser(
+        role: 'driver',
+        userId:
+            rewardedInviterId,
+        title:
+            'وصلتك مكافأة دعوة 🎁',
+        body:
+            'تمت إضافة $driverReferralRewardIqd د.ع إلى رصيدك.',
+        data: const {
+          'type': 'reward',
+        },
+      );
+    }
+  }
+}
+
+class DriverInviteFriendsPage
+    extends StatefulWidget {
+  final String driverId;
+  final String driverName;
+
+  const DriverInviteFriendsPage({
+    super.key,
+    required this.driverId,
+    required this.driverName,
+  });
+
+  @override
+  State<DriverInviteFriendsPage>
+      createState() =>
+          _DriverInviteFriendsPageState();
+}
+
+class _DriverInviteFriendsPageState
+    extends State<DriverInviteFriendsPage> {
+  String _code = '';
+  int _pending = 0;
+  int _rewarded = 0;
+  bool _loading = true;
+  bool _sharing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final code =
+          await DriverReferralService
+              .ensureInviteCode(
+        widget.driverId,
+      );
+
+      final referrals =
+          await FirebaseFirestore
+              .instance
+              .collection(
+                'driver_referrals',
+              )
+              .where(
+                'inviterDriverId',
+                isEqualTo:
+                    widget.driverId,
+              )
+              .get();
+
+      int pending = 0;
+      int rewarded = 0;
+
+      for (final doc
+          in referrals.docs) {
+        final status =
+            stringValue(
+          doc.data()['status'],
+        );
+
+        if (status ==
+            'rewarded') {
+          rewarded++;
+        } else {
+          pending++;
+        }
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        _code = code;
+        _pending = pending;
+        _rewarded = rewarded;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void>
+      _shareWhatsApp() async {
+    if (_sharing) return;
+
+    setState(() {
+      _sharing = true;
+    });
+
+    try {
+      var code = _code;
+
+      if (code.isEmpty) {
+        code =
+            await DriverReferralService
+                .ensureInviteCode(
+          widget.driverId,
+        );
+      }
+
+      if (code.isEmpty) {
+        throw Exception(
+          'تعذر إنشاء كود الدعوة',
+        );
+      }
+
+      final name =
+          widget.driverName.trim();
+
+      final message =
+          'هلا 👋 ${name.isEmpty ? '' : 'أنا $name وأدعوك '}'
+          'تسجل كسائق بتطبيق تكتك. '
+          'وقت التسجيل اكتب كود الدعوة: $code\n'
+          'بعد ما تكمل $driverReferralRequiredRides رحلات، '
+          'تنحسب مكافأة الدعوة 🎁';
+
+      final uri = Uri.parse(
+        'https://wa.me/?text=${Uri.encodeComponent(message)}',
+      );
+
+      final opened =
+          await launchUrl(
+        uri,
+        mode: LaunchMode
+            .externalApplication,
+      );
+
+      if (!opened) {
+        throw Exception(
+          'تعذر فتح واتساب',
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        SnackBar(
+          content: Text(
+            e
+                .toString()
+                .replaceFirst(
+                  'Exception: ',
+                  '',
+                ),
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sharing = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(
+    BuildContext context,
+  ) {
+    return Directionality(
+      textDirection:
+          TextDirection.rtl,
+      child: Scaffold(
+        backgroundColor:
+            const Color(
+          0xffF6F7F9,
+        ),
+        appBar: AppBar(
+          title: const Text(
+            'دعوة الأصدقاء',
+          ),
+        ),
+        body: _loading
+            ? const Center(
+                child:
+                    CircularProgressIndicator(),
+              )
+            : ListView(
+                padding:
+                    const EdgeInsets.all(
+                  18,
+                ),
+                children: [
+                  Container(
+                    padding:
+                        const EdgeInsets.all(
+                      22,
+                    ),
+                    decoration:
+                        BoxDecoration(
+                      color:
+                          Colors.white,
+                      borderRadius:
+                          BorderRadius
+                              .circular(
+                        24,
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        const CircleAvatar(
+                          radius: 34,
+                          backgroundColor:
+                              Color(
+                            0xffFFF3C4,
+                          ),
+                          child: Icon(
+                            Icons
+                                .card_giftcard_rounded,
+                            size: 36,
+                            color:
+                                Color(
+                              0xffA97400,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(
+                          height: 14,
+                        ),
+                        const Text(
+                          'ادعُ صديق واربح',
+                          style:
+                              TextStyle(
+                            fontSize: 22,
+                            fontWeight:
+                                FontWeight
+                                    .w900,
+                          ),
+                        ),
+                        const SizedBox(
+                          height: 8,
+                        ),
+                        Text(
+                          'إذا سجل صديقك بكودك وكمل '
+                          '$driverReferralRequiredRides رحلات، '
+                          'يضاف إلى رصيدك $driverReferralRewardIqd د.ع.',
+                          textAlign:
+                              TextAlign
+                                  .center,
+                          style:
+                              const TextStyle(
+                            color:
+                                Colors
+                                    .black54,
+                            height: 1.5,
+                          ),
+                        ),
+                        const SizedBox(
+                          height: 20,
+                        ),
+                        Container(
+                          width:
+                              double
+                                  .infinity,
+                          padding:
+                              const EdgeInsets
+                                  .all(
+                            16,
+                          ),
+                          decoration:
+                              BoxDecoration(
+                            color:
+                                const Color(
+                              0xffFFF8DE,
+                            ),
+                            borderRadius:
+                                BorderRadius
+                                    .circular(
+                              16,
+                            ),
+                          ),
+                          child: Column(
+                            children: [
+                              const Text(
+                                'كود دعوتك',
+                                style:
+                                    TextStyle(
+                                  color:
+                                      Colors
+                                          .black54,
+                                  fontWeight:
+                                      FontWeight
+                                          .w700,
+                                ),
+                              ),
+                              const SizedBox(
+                                height:
+                                    5,
+                              ),
+                              SelectableText(
+                                _code,
+                                textAlign:
+                                    TextAlign
+                                        .center,
+                                style:
+                                    const TextStyle(
+                                  fontSize:
+                                      28,
+                                  fontWeight:
+                                      FontWeight
+                                          .w900,
+                                  letterSpacing:
+                                      2,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(
+                          height: 16,
+                        ),
+                        SizedBox(
+                          width:
+                              double
+                                  .infinity,
+                          height: 56,
+                          child:
+                              ElevatedButton
+                                  .icon(
+                            onPressed:
+                                _sharing
+                                    ? null
+                                    : _shareWhatsApp,
+                            icon:
+                                const Icon(
+                              Icons
+                                  .send_rounded,
+                            ),
+                            label: Text(
+                              _sharing
+                                  ? 'جاري فتح واتساب...'
+                                  : 'إرسال الدعوة عبر واتساب',
+                              style:
+                                  const TextStyle(
+                                fontSize:
+                                    16,
+                                fontWeight:
+                                    FontWeight
+                                        .w900,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(
+                    height: 14,
+                  ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _stat(
+                          'بانتظار الإكمال',
+                          _pending,
+                        ),
+                      ),
+                      const SizedBox(
+                        width: 10,
+                      ),
+                      Expanded(
+                        child: _stat(
+                          'مكافآت مكتملة',
+                          _rewarded,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+
+  Widget _stat(
+    String title,
+    int value,
+  ) {
+    return Container(
+      padding:
+          const EdgeInsets.symmetric(
+        vertical: 18,
+        horizontal: 12,
+      ),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius:
+            BorderRadius.circular(
+          18,
+        ),
+      ),
+      child: Column(
+        children: [
+          Text(
+            '$value',
+            style:
+                const TextStyle(
+              fontSize: 24,
+              fontWeight:
+                  FontWeight.w900,
+            ),
+          ),
+          const SizedBox(
+            height: 4,
+          ),
+          Text(
+            title,
+            textAlign:
+                TextAlign.center,
+            style:
+                const TextStyle(
+              color:
+                  Colors.black54,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
 class InviteFriendsPage extends StatefulWidget {
   final String customerId;
 
@@ -1863,6 +2709,130 @@ class GoogleMapsService {
     return results.first['formatted_address']?.toString() ?? '';
   }
 
+  static Future<String> reverseGeocodeArea(
+    LatLng point,
+  ) async {
+    _ensureConfigured();
+
+    final uri = Uri.https(
+      'maps.googleapis.com',
+      '/maps/api/geocode/json',
+      {
+        'latlng':
+            '${point.latitude},${point.longitude}',
+        'language': 'ar',
+        'region': 'iq',
+        'key': googleWebApiKey,
+      },
+    );
+
+    try {
+      final response = await http
+          .get(uri)
+          .timeout(
+            const Duration(seconds: 4),
+          );
+
+      if (response.statusCode != 200) {
+        return '';
+      }
+
+      final data =
+          jsonDecode(response.body)
+              as Map<String, dynamic>;
+
+      if (stringValue(data['status']) !=
+          'OK') {
+        return '';
+      }
+
+      final results =
+          data['results']
+                  as List<dynamic>? ??
+              const [];
+
+      const wantedTypes = <String>[
+        'neighborhood',
+        'sublocality_level_1',
+        'sublocality',
+        'locality',
+        'administrative_area_level_3',
+      ];
+
+      for (final rawResult
+          in results.take(8)) {
+        if (rawResult
+            is! Map<String, dynamic>) {
+          continue;
+        }
+
+        final components =
+            rawResult[
+                    'address_components']
+                as List<dynamic>? ??
+            const [];
+
+        for (final wanted
+            in wantedTypes) {
+          for (final rawComponent
+              in components) {
+            if (rawComponent
+                is! Map<String, dynamic>) {
+              continue;
+            }
+
+            final types = (rawComponent[
+                        'types']
+                    as List<dynamic>? ??
+                const [])
+                .map(
+                  (e) => e.toString(),
+                )
+                .toList();
+
+            if (!types.contains(wanted)) {
+              continue;
+            }
+
+            final name = stringValue(
+              rawComponent['long_name'],
+            ).trim();
+
+            if (name.isNotEmpty &&
+                name != 'بغداد' &&
+                name !=
+                    'محافظة بغداد' &&
+                name != 'العراق') {
+              return name;
+            }
+          }
+        }
+      }
+
+      for (final rawResult
+          in results.take(4)) {
+        if (rawResult
+            is! Map<String, dynamic>) {
+          continue;
+        }
+
+        final cleaned =
+            compactPlaceName(
+          stringValue(
+            rawResult[
+                'formatted_address'],
+          ),
+        );
+
+        if (cleaned.isNotEmpty) {
+          return cleaned;
+        }
+      }
+    } catch (_) {}
+
+    return '';
+  }
+
   static Future<List<PlaceResult>> autocomplete(
     String input, {
     LatLng? center,
@@ -2087,10 +3057,12 @@ class GoogleMapsService {
 
     return PlaceResult(
       placeId: placeId,
-      displayName: formattedAddress.isNotEmpty
-          ? formattedAddress
-          : displayName,
-      secondaryText: displayName,
+      displayName:
+          displayName.isNotEmpty
+              ? displayName
+              : formattedAddress,
+      secondaryText:
+          formattedAddress,
       lat: latitude,
       lng: longitude,
     );
@@ -3865,6 +4837,7 @@ class _CustomerPageState extends State<CustomerPage> {
 
   Timer? _addressDebounce;
   String? _rideRequestId;
+  bool _restoringActiveRide = false;
   List<SavedPlace> _savedPlaces = [];
 
   late final VoidCallback _pricingListener;
@@ -3905,9 +4878,17 @@ class _CustomerPageState extends State<CustomerPage> {
     // نخلي الواجهة تظهر أولاً، وبعدين نحمل البيانات بالتوازي.
     unawaited(_loadCustomerProfile());
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(_loadSavedPlaces());
-      unawaited(_getCurrentLocation());
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) {
+      unawaited(
+        _loadSavedPlaces(),
+      );
+      unawaited(
+        _getCurrentLocation(),
+      );
+      unawaited(
+        _restoreActiveCustomerRide(),
+      );
     });
   }
 
@@ -5037,6 +6018,181 @@ class _CustomerPageState extends State<CustomerPage> {
   }
 
 
+  Future<void>
+      _restoreActiveCustomerRide() async {
+    if (_restoringActiveRide) return;
+
+    _restoringActiveRide = true;
+
+    try {
+      final prefs =
+          await SharedPreferences
+              .getInstance();
+
+      var rideId =
+          prefs.getString(
+                'customer_active_ride_id',
+              ) ??
+              '';
+
+      if (rideId.isEmpty) {
+        final customerId =
+            widget.customerId ?? '';
+
+        if (customerId.isNotEmpty) {
+          final rides =
+              await FirebaseFirestore
+                  .instance
+                  .collection(
+                    'ride_requests',
+                  )
+                  .where(
+                    'customerId',
+                    isEqualTo:
+                        customerId,
+                  )
+                  .get();
+
+          DateTime newest =
+              DateTime
+                  .fromMillisecondsSinceEpoch(
+            0,
+          );
+
+          for (final ride
+              in rides.docs) {
+            final data =
+                ride.data();
+
+            final status =
+                stringValue(
+              data['status'],
+            );
+
+            final active =
+                status == 'searching' ||
+                    status ==
+                        'accepted' ||
+                    status ==
+                        'arrived' ||
+                    status ==
+                        'started';
+
+            if (!active) continue;
+
+            final created =
+                timestampToDate(
+                  data['createdAt'],
+                ) ??
+                DateTime
+                    .fromMillisecondsSinceEpoch(
+                  0,
+                );
+
+            if (created
+                .isAfter(newest)) {
+              newest = created;
+              rideId = ride.id;
+            }
+          }
+        }
+      }
+
+      if (rideId.isEmpty) {
+        return;
+      }
+
+      final snap =
+          await FirebaseFirestore
+              .instance
+              .collection(
+                'ride_requests',
+              )
+              .doc(rideId)
+              .get();
+
+      if (!snap.exists) {
+        await prefs.remove(
+          'customer_active_ride_id',
+        );
+        return;
+      }
+
+      final status =
+          stringValue(
+        snap.data()?['status'],
+      );
+
+      final active =
+          status == 'searching' ||
+              status == 'accepted' ||
+              status == 'arrived' ||
+              status == 'started';
+
+      if (!active) {
+        await prefs.remove(
+          'customer_active_ride_id',
+        );
+        return;
+      }
+
+      await prefs.setString(
+        'customer_active_ride_id',
+        rideId,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        _rideRequestId =
+            rideId;
+      });
+
+      _showRideTracking();
+    } catch (_) {
+      // نخلي التطبيق يفتح حتى إذا صار خطأ شبكة.
+    } finally {
+      _restoringActiveRide =
+          false;
+    }
+  }
+
+  Future<bool>
+      _isRideStillActive(
+    String rideId,
+  ) async {
+    try {
+      final snap =
+          await FirebaseFirestore
+              .instance
+              .collection(
+                'ride_requests',
+              )
+              .doc(rideId)
+              .get();
+
+      if (!snap.exists) {
+        return false;
+      }
+
+      final status =
+          stringValue(
+        snap.data()?['status'],
+      );
+
+      return status ==
+              'searching' ||
+          status ==
+              'accepted' ||
+          status ==
+              'arrived' ||
+          status ==
+              'started';
+    } catch (_) {
+      return true;
+    }
+  }
+
   Future<void> _sendRideRequest() async {
     if (_pickup == null || _destination == null) return;
     if (_sendingRequest) return;
@@ -5083,11 +6239,74 @@ class _CustomerPageState extends State<CustomerPage> {
         _customerPhoneController.text.trim(),
       );
 
-      final rideRef = FirebaseFirestore.instance
-          .collection('ride_requests')
-          .doc();
+      final rideRef =
+          FirebaseFirestore.instance
+              .collection(
+                'ride_requests',
+              )
+              .doc();
 
-      final rewardToUse = _rewardApplied;
+      var pickupArea =
+          compactPlaceName(
+        _pickupAddress,
+      );
+
+      var destinationArea =
+          compactPlaceName(
+        _destinationAddress,
+      );
+
+      final areaResults =
+          await Future.wait<String>([
+        placeNeedsAreaLookup(
+          _pickupAddress,
+        )
+            ? GoogleMapsService
+                .reverseGeocodeArea(
+                _pickup!,
+              )
+            : Future.value(
+                pickupArea,
+              ),
+        placeNeedsAreaLookup(
+          _destinationAddress,
+        )
+            ? GoogleMapsService
+                .reverseGeocodeArea(
+                _destination!,
+              )
+            : Future.value(
+                destinationArea,
+              ),
+      ]).timeout(
+        const Duration(
+          seconds: 5,
+        ),
+        onTimeout: () =>
+            <String>[
+          pickupArea,
+          destinationArea,
+        ],
+      );
+
+      if (areaResults[0]
+          .trim()
+          .isNotEmpty) {
+        pickupArea =
+            areaResults[0]
+                .trim();
+      }
+
+      if (areaResults[1]
+          .trim()
+          .isNotEmpty) {
+        destinationArea =
+            areaResults[1]
+                .trim();
+      }
+
+      final rewardToUse =
+          _rewardApplied;
 
       final rideData = <String, dynamic>{
         'status': 'searching',
@@ -5098,10 +6317,18 @@ class _CustomerPageState extends State<CustomerPage> {
             _customerPhoneController.text.trim(),
         'pickupLat': _pickup!.latitude,
         'pickupLng': _pickup!.longitude,
-        'pickupAddress': _pickupAddress,
-        'destinationLat': _destination!.latitude,
-        'destinationLng': _destination!.longitude,
-        'destinationAddress': _destinationAddress,
+        'pickupAddress':
+            _pickupAddress,
+        'pickupArea':
+            pickupArea,
+        'destinationLat':
+            _destination!.latitude,
+        'destinationLng':
+            _destination!.longitude,
+        'destinationAddress':
+            _destinationAddress,
+        'destinationArea':
+            destinationArea,
         'distanceKm': _distanceKm,
         'routeDistanceMeters': _routeDistanceMeters,
         'routeDuration': _routeDuration,
@@ -5222,11 +6449,18 @@ class _CustomerPageState extends State<CustomerPage> {
         );
       }
 
+      await prefs.setString(
+        'customer_active_ride_id',
+        rideRef.id,
+      );
+
       if (!mounted) return;
 
       setState(() {
-        _rideRequestId = rideRef.id;
-        _sendingRequest = false;
+        _rideRequestId =
+            rideRef.id;
+        _sendingRequest =
+            false;
       });
 
       _showRideTracking();
@@ -5260,11 +6494,34 @@ class _CustomerPageState extends State<CustomerPage> {
           rideId: rideId,
         ),
       ),
-    ).then((_) {
+    ).then((_) async {
+      final prefs =
+          await SharedPreferences
+              .getInstance();
+
+      final active =
+          await _isRideStillActive(
+        rideId,
+      );
+
+      if (active) {
+        await prefs.setString(
+          'customer_active_ride_id',
+          rideId,
+        );
+      } else {
+        await prefs.remove(
+          'customer_active_ride_id',
+        );
+      }
+
       if (!mounted) return;
 
       setState(() {
-        _rideRequestId = null;
+        _rideRequestId =
+            active
+                ? rideId
+                : null;
       });
     });
   }
@@ -6547,9 +7804,19 @@ class CustomerRideTrackingPage extends StatelessWidget {
 
     if (!context.mounted) return;
 
-    final prefs = await SharedPreferences.getInstance();
+    final prefs =
+        await SharedPreferences
+            .getInstance();
+
+    await prefs.remove(
+      'customer_active_ride_id',
+    );
+
     final customerId =
-        prefs.getString('session_user_id') ?? '';
+        prefs.getString(
+              'session_user_id',
+            ) ??
+            '';
 
     Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute(
@@ -6565,12 +7832,68 @@ class CustomerRideTrackingPage extends StatelessWidget {
   Future<void> _openChat(
     BuildContext context,
   ) async {
+    try {
+      final messages =
+          await FirebaseFirestore
+              .instance
+              .collection(
+                'ride_requests',
+              )
+              .doc(rideId)
+              .collection(
+                'messages',
+              )
+              .where(
+                'senderRole',
+                isEqualTo:
+                    'driver',
+              )
+              .get();
+
+      if (messages
+          .docs
+          .isNotEmpty) {
+        final batch =
+            FirebaseFirestore
+                .instance
+                .batch();
+
+        for (final message
+            in messages.docs) {
+          if (message.data()[
+                  'readByCustomer'] ==
+              true) {
+            continue;
+          }
+
+          batch.update(
+            message.reference,
+            {
+              'readByCustomer':
+                  true,
+              'readByCustomerAt':
+                  FieldValue
+                      .serverTimestamp(),
+            },
+          );
+        }
+
+        await batch.commit();
+      }
+    } catch (_) {}
+
+    if (!context.mounted) {
+      return;
+    }
+
     await Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => RideChatPage(
+        builder: (_) =>
+            RideChatPage(
           rideId: rideId,
-          senderRole: 'customer',
+          senderRole:
+              'customer',
         ),
       ),
     );
@@ -6926,14 +8249,6 @@ class CustomerRideTrackingPage extends StatelessWidget {
         stringValue(
           data['driverProfilePhotoUrl'],
         ).trim();
-    final tuktukNumber =
-        stringValue(
-          data['driverTuktukNumber'],
-        ).trim();
-    final tuktukColor =
-        stringValue(
-          data['driverTuktukColor'],
-        ).trim();
     final rating = doubleValue(
       data['driverRating'] ??
           data['rating'],
@@ -7041,76 +8356,50 @@ class CustomerRideTrackingPage extends StatelessWidget {
                 height: 22,
               ),
               Container(
+                width: double.infinity,
                 padding:
-                    const EdgeInsets.all(
-                  12,
+                    const EdgeInsets
+                        .symmetric(
+                  horizontal: 16,
+                  vertical: 14,
                 ),
                 decoration:
                     BoxDecoration(
                   color:
                       const Color(
-                    0xffFAFAFA,
+                    0xffF7F8FA,
                   ),
                   borderRadius:
-                      BorderRadius.circular(
-                    14,
-                  ),
-                  border: Border.all(
-                    color:
-                        const Color(
-                      0xffEEEEEE,
-                    ),
+                      BorderRadius
+                          .circular(
+                    16,
                   ),
                 ),
                 child: Row(
                   children: [
-                    SizedBox(
-                      width: 72,
-                      height: 58,
-                      child: Image.asset(
-                        'assets/images/tuktuk_search_reference.png',
-                        fit: BoxFit.cover,
+                    const Icon(
+                      Icons
+                          .verified_user_rounded,
+                      color:
+                          Color(
+                        0xff22A663,
                       ),
                     ),
                     const SizedBox(
-                      width: 12,
+                      width: 10,
                     ),
                     Expanded(
-                      child: Column(
-                        crossAxisAlignment:
-                            CrossAxisAlignment
-                                .start,
-                        children: [
-                          Text(
-                            tuktukColor
-                                    .isEmpty
-                                ? 'تكتك أصفر'
-                                : 'تكتك $tuktukColor',
-                            style:
-                                const TextStyle(
-                              fontSize: 16,
-                              fontWeight:
-                                  FontWeight
-                                      .w900,
-                            ),
-                          ),
-                          const SizedBox(
-                            height: 4,
-                          ),
-                          Text(
-                            tuktukNumber
-                                    .isEmpty
-                                ? 'بغداد'
-                                : '$tuktukNumber - بغداد',
-                            style:
-                                const TextStyle(
-                              fontSize: 12,
-                              color:
-                                  Colors
-                                      .black54,
-                            ),
-                          ),
-                        ],
+                      child: Text(
+                        data['driverVerified'] ==
+                                true
+                            ? 'سائق موثق • متوجه إلى موقعك'
+                            : 'السائق متوجه إلى موقعك',
+                        style:
+                            const TextStyle(
+                          fontWeight:
+                              FontWeight
+                                  .w800,
+                        ),
                       ),
                     ),
                   ],
@@ -7142,14 +8431,65 @@ class CustomerRideTrackingPage extends StatelessWidget {
                   ),
                   Expanded(
                     child:
-                        _rideContactAction(
-                      icon: Icons
-                          .chat_bubble_outline_rounded,
-                      label: 'رسالة',
-                      onTap: () =>
-                          _openChat(
-                        context,
-                      ),
+                        StreamBuilder<
+                            QuerySnapshot>(
+                      stream:
+                          FirebaseFirestore
+                              .instance
+                              .collection(
+                                'ride_requests',
+                              )
+                              .doc(
+                                rideId,
+                              )
+                              .collection(
+                                'messages',
+                              )
+                              .where(
+                                'senderRole',
+                                isEqualTo:
+                                    'driver',
+                              )
+                              .snapshots(),
+                      builder:
+                          (context,
+                              snapshot) {
+                        int unread = 0;
+
+                        if (snapshot
+                            .hasData) {
+                          for (final doc
+                              in snapshot
+                                  .data!
+                                  .docs) {
+                            final message =
+                                doc.data()
+                                    as Map<
+                                        String,
+                                        dynamic>;
+
+                            if (message[
+                                    'readByCustomer'] !=
+                                true) {
+                              unread++;
+                            }
+                          }
+                        }
+
+                        return _rideContactActionWithBadge(
+                          icon:
+                              Icons
+                                  .chat_bubble_outline_rounded,
+                          label:
+                              'رسالة',
+                          badgeCount:
+                              unread,
+                          onTap: () =>
+                              _openChat(
+                            context,
+                          ),
+                        );
+                      },
                     ),
                   ),
                   Expanded(
@@ -7175,6 +8515,108 @@ class CustomerRideTrackingPage extends StatelessWidget {
     );
   }
 
+
+  Widget _rideContactActionWithBadge({
+    required IconData icon,
+    required String label,
+    required int badgeCount,
+    required Future<void> Function()? onTap,
+  }) {
+    return InkWell(
+      borderRadius:
+          BorderRadius.circular(18),
+      onTap: onTap == null
+          ? null
+          : () {
+              onTap();
+            },
+      child: Padding(
+        padding:
+            const EdgeInsets.symmetric(
+          vertical: 10,
+          horizontal: 4,
+        ),
+        child: Column(
+          mainAxisSize:
+              MainAxisSize.min,
+          children: [
+            Stack(
+              clipBehavior:
+                  Clip.none,
+              children: [
+                Icon(
+                  icon,
+                  size: 28,
+                  color:
+                      const Color(
+                    0xff202124,
+                  ),
+                ),
+                if (badgeCount > 0)
+                  PositionedDirectional(
+                    end: -10,
+                    top: -10,
+                    child:
+                        Container(
+                      constraints:
+                          const BoxConstraints(
+                        minWidth: 20,
+                        minHeight:
+                            20,
+                      ),
+                      padding:
+                          const EdgeInsets
+                              .symmetric(
+                        horizontal:
+                            5,
+                      ),
+                      alignment:
+                          Alignment
+                              .center,
+                      decoration:
+                          const BoxDecoration(
+                        color:
+                            Colors.red,
+                        shape:
+                            BoxShape
+                                .circle,
+                      ),
+                      child: Text(
+                        badgeCount > 9
+                            ? '9+'
+                            : '$badgeCount',
+                        style:
+                            const TextStyle(
+                          color:
+                              Colors.white,
+                          fontSize:
+                              11,
+                          fontWeight:
+                              FontWeight
+                                  .w900,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(
+              height: 6,
+            ),
+            Text(
+              label,
+              style:
+                  const TextStyle(
+                fontWeight:
+                    FontWeight
+                        .w800,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _rideContactAction({
     required IconData icon,
@@ -7323,10 +8765,6 @@ class CustomerRideTrackingPage extends StatelessWidget {
                 stringValue(data['driverPhone']);
             final driverProfilePhotoUrl =
                 stringValue(data['driverProfilePhotoUrl']);
-            final driverTuktukNumber =
-                stringValue(data['driverTuktukNumber']);
-            final driverTuktukColor =
-                stringValue(data['driverTuktukColor']);
             final driverVerified =
                 data['driverVerified'] == true;
             final fare = intValue(data['price']);
@@ -7726,23 +9164,6 @@ class CustomerRideTrackingPage extends StatelessWidget {
                                             ],
                                           ],
                                         ),
-                                        if (driverTuktukNumber.isNotEmpty ||
-                                            driverTuktukColor.isNotEmpty)
-                                          Text(
-                                            [
-                                              if (driverTuktukNumber.isNotEmpty)
-                                                'رقم التكتك $driverTuktukNumber',
-                                              if (driverTuktukColor.isNotEmpty)
-                                                driverTuktukColor,
-                                            ].join(' • '),
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              fontSize: 12,
-                                              color: Colors.black54,
-                                              fontWeight: FontWeight.w600,
-                                            ),
-                                          ),
                                       ],
                                     ),
                                   ),
@@ -9710,8 +11131,7 @@ class _DriverRegisterPageState
   final _name = TextEditingController();
   final _phone = TextEditingController();
   final _password = TextEditingController();
-  final _tuktukNumber = TextEditingController();
-  final _tuktukColor = TextEditingController();
+  final _inviteCode = TextEditingController();
 
   final _picker = ImagePicker();
   XFile? _profilePhoto;
@@ -9724,8 +11144,7 @@ class _DriverRegisterPageState
     _name.dispose();
     _phone.dispose();
     _password.dispose();
-    _tuktukNumber.dispose();
-    _tuktukColor.dispose();
+    _inviteCode.dispose();
     super.dispose();
   }
 
@@ -9820,6 +11239,10 @@ class _DriverRegisterPageState
     final phone = normalizePhone(_phone.text);
     final name = _name.text.trim();
     final password = _password.text;
+    final referralCode =
+        _inviteCode.text
+            .trim()
+            .toUpperCase();
 
     if (name.length < 2 ||
         phone.length < 10 ||
@@ -9861,6 +11284,20 @@ class _DriverRegisterPageState
     setState(() => _loading = true);
 
     try {
+      String inviterDriverId = '';
+
+      if (referralCode.isNotEmpty) {
+        inviterDriverId =
+            await DriverReferralService
+                .findInviterIdByCode(
+          referralCode,
+        );
+
+        if (inviterDriverId.isEmpty) {
+          throw Exception('كود الدعوة غير صحيح');
+        }
+      }
+
       final old = await FirebaseFirestore.instance
           .collection('drivers')
           .where('phone', isEqualTo: phone)
@@ -9895,11 +11332,19 @@ class _DriverRegisterPageState
       await ref.set({
         'name': name,
         'phone': phone,
-        'passwordHash': hashPassword(password),
-        'tuktukNumber':
-            _tuktukNumber.text.trim(),
-        'tuktukColor':
-            _tuktukColor.text.trim(),
+        'passwordHash':
+            hashPassword(password),
+        'inviteCode':
+            DriverReferralService
+                .buildInviteCode(
+          ref.id,
+        ),
+        if (inviterDriverId.isNotEmpty)
+          'referredByDriverId':
+              inviterDriverId,
+        if (referralCode.isNotEmpty)
+          'referralCodeUsed':
+              referralCode,
         'profilePhotoUrl': profileUrl,
         'profilePhotoPath': '${ref.id}/profile.jpg',
         'idFrontPath': idFrontPath,
@@ -9913,6 +11358,16 @@ class _DriverRegisterPageState
         'createdAt':
             FieldValue.serverTimestamp(),
       });
+
+      if (inviterDriverId.isNotEmpty) {
+        await DriverReferralService
+            .createPendingReferral(
+          inviterDriverId:
+              inviterDriverId,
+          referredDriverId: ref.id,
+          code: referralCode,
+        );
+      }
 
       if (!mounted) return;
 
@@ -10048,27 +11503,20 @@ class _DriverRegisterPageState
                 labelText: 'كلمة السر',
               ),
             ),
-            const SizedBox(height: 20),
-            const Text(
-              'معلومات التكتك',
-              style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
             const SizedBox(height: 12),
             TextField(
-              controller: _tuktukNumber,
-              decoration: const InputDecoration(
+              controller: _inviteCode,
+              textCapitalization:
+                  TextCapitalization.characters,
+              decoration:
+                  const InputDecoration(
                 labelText:
-                    'رقم التكتك / رقم اللوحة (إن وجد)',
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _tuktukColor,
-              decoration: const InputDecoration(
-                labelText: 'لون التكتك',
+                    'كود دعوة صديق (اختياري)',
+                hintText:
+                    'مثال: DRV12AB34',
+                prefixIcon: Icon(
+                  Icons.card_giftcard_rounded,
+                ),
               ),
             ),
             const SizedBox(height: 20),
@@ -10200,15 +11648,6 @@ class DriverAccountHubPage
             final balance =
                 intValue(data['balance']);
 
-            final tuktukNumber =
-                stringValue(
-              data['tuktukNumber'],
-            );
-
-            final tuktukColor =
-                stringValue(
-              data['tuktukColor'],
-            );
 
             return ListView(
               padding:
@@ -10381,6 +11820,29 @@ class DriverAccountHubPage
                 _accountTile(
                   context,
                   icon:
+                      Icons.group_add_rounded,
+                  title:
+                      'دعوة الأصدقاء',
+                  subtitle:
+                      'شارك عبر واتساب واربح $driverReferralRewardIqd د.ع بعد إكمال صديقك $driverReferralRequiredRides رحلات',
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) =>
+                            DriverInviteFriendsPage(
+                          driverId:
+                              driver.id,
+                          driverName:
+                              name,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+                _accountTile(
+                  context,
+                  icon:
                       Icons.receipt_long_rounded,
                   title: 'سجل الرحلات',
                   subtitle:
@@ -10391,35 +11853,6 @@ class DriverAccountHubPage
                       MaterialPageRoute(
                         builder: (_) =>
                             DriverRideHistoryPage(
-                          driver: driver,
-                        ),
-                      ),
-                    );
-                  },
-                ),
-                _accountTile(
-                  context,
-                  icon:
-                      Icons.electric_rickshaw_rounded,
-                  title: 'بيانات التكتك',
-                  subtitle: [
-                    if (tuktukNumber
-                        .isNotEmpty)
-                      'رقم $tuktukNumber',
-                    if (tuktukColor
-                        .isNotEmpty)
-                      tuktukColor,
-                    if (tuktukNumber
-                            .isEmpty &&
-                        tuktukColor.isEmpty)
-                      'أضف رقم ولون التكتك',
-                  ].join(' • '),
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            DriverSettingsPage(
                           driver: driver,
                         ),
                       ),
@@ -10559,8 +11992,6 @@ class DriverSettingsPage extends StatefulWidget {
 
 class _DriverSettingsPageState extends State<DriverSettingsPage> {
   final _password = TextEditingController();
-  final _tuktukNumber = TextEditingController();
-  final _tuktukColor = TextEditingController();
   final _picker = ImagePicker();
 
   String _photoUrl = '';
@@ -10569,16 +12000,13 @@ class _DriverSettingsPageState extends State<DriverSettingsPage> {
   @override
   void initState() {
     super.initState();
-    _photoUrl = widget.driver.profilePhotoUrl;
-    _tuktukNumber.text = widget.driver.tuktukNumber;
-    _tuktukColor.text = widget.driver.tuktukColor;
+    _photoUrl =
+        widget.driver.profilePhotoUrl;
   }
 
   @override
   void dispose() {
     _password.dispose();
-    _tuktukNumber.dispose();
-    _tuktukColor.dispose();
     super.dispose();
   }
 
@@ -10692,10 +12120,10 @@ class _DriverSettingsPageState extends State<DriverSettingsPage> {
 
     setState(() => _saving = true);
 
-    final update = <String, dynamic>{
-      'tuktukNumber': _tuktukNumber.text.trim(),
-      'tuktukColor': _tuktukColor.text.trim(),
-      'updatedAt': FieldValue.serverTimestamp(),
+    final update =
+        <String, dynamic>{
+      'updatedAt':
+          FieldValue.serverTimestamp(),
     };
 
     if (_password.text.isNotEmpty) {
@@ -10770,23 +12198,6 @@ class _DriverSettingsPageState extends State<DriverSettingsPage> {
             ),
             const SizedBox(height: 24),
             TextField(
-              controller: _tuktukNumber,
-              decoration: const InputDecoration(
-                labelText: 'رقم التكتك',
-                prefixIcon:
-                    Icon(Icons.electric_rickshaw_rounded),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _tuktukColor,
-              decoration: const InputDecoration(
-                labelText: 'لون التكتك',
-                prefixIcon: Icon(Icons.palette_rounded),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
               controller: _password,
               obscureText: true,
               decoration: const InputDecoration(
@@ -10835,18 +12246,36 @@ class _DriverHomePageState
   Timer? _heartbeatTimer;
   Timer? _offerTimer;
   String? _currentOfferId;
-  int _offerSeconds = 15;
+  int _offerSeconds = 50;
   bool _accepting = false;
 
-  final Set<String> _alertedNearbyRides =
+  final Set<String>
+      _skippedOfferIds =
+      <String>{};
+
+  final Set<String>
+      _resolvingOfferAreas =
+      <String>{};
+
+  final Set<String>
+      _alertedNearbyRides =
       <String>{};
 
   @override
   void initState() {
     super.initState();
 
-    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance
+        .addObserver(this);
+
     _goOnline();
+
+    unawaited(
+      DriverReferralService
+          .ensureInviteCode(
+        widget.driver.id,
+      ),
+    );
   }
 
   @override
@@ -10986,6 +12415,148 @@ class _DriverHomePageState
     );
   }
 
+  void _openDriverInvites() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            DriverInviteFriendsPage(
+          driverId:
+              widget.driver.id,
+          driverName:
+              widget.driver.name,
+        ),
+      ),
+    );
+  }
+
+  Future<void>
+      _ensureOfferAreaNames(
+    String rideId,
+    Map<String, dynamic> data,
+  ) async {
+    if (_resolvingOfferAreas
+        .contains(rideId)) {
+      return;
+    }
+
+    final currentPickup =
+        stringValue(
+      data['pickupArea'],
+    ).trim();
+
+    final currentDestination =
+        stringValue(
+      data['destinationArea'],
+    ).trim();
+
+    if (currentPickup.isNotEmpty &&
+        currentDestination
+            .isNotEmpty) {
+      return;
+    }
+
+    final pickupLat =
+        doubleValue(
+      data['pickupLat'],
+    );
+
+    final pickupLng =
+        doubleValue(
+      data['pickupLng'],
+    );
+
+    final destinationLat =
+        doubleValue(
+      data['destinationLat'],
+    );
+
+    final destinationLng =
+        doubleValue(
+      data['destinationLng'],
+    );
+
+    if (pickupLat == 0 ||
+        pickupLng == 0 ||
+        destinationLat == 0 ||
+        destinationLng == 0) {
+      return;
+    }
+
+    _resolvingOfferAreas
+        .add(rideId);
+
+    try {
+      final names =
+          await Future.wait<String>([
+        currentPickup.isNotEmpty
+            ? Future.value(
+                currentPickup,
+              )
+            : GoogleMapsService
+                .reverseGeocodeArea(
+                LatLng(
+                  pickupLat,
+                  pickupLng,
+                ),
+              ),
+        currentDestination
+                .isNotEmpty
+            ? Future.value(
+                currentDestination,
+              )
+            : GoogleMapsService
+                .reverseGeocodeArea(
+                LatLng(
+                  destinationLat,
+                  destinationLng,
+                ),
+              ),
+      ]);
+
+      final update =
+          <String, dynamic>{};
+
+      if (currentPickup.isEmpty &&
+          names[0]
+              .trim()
+              .isNotEmpty) {
+        update['pickupArea'] =
+            names[0].trim();
+      }
+
+      if (currentDestination
+              .isEmpty &&
+          names[1]
+              .trim()
+              .isNotEmpty) {
+        update[
+                'destinationArea'] =
+            names[1].trim();
+      }
+
+      if (update.isNotEmpty) {
+        await FirebaseFirestore
+            .instance
+            .collection(
+              'ride_requests',
+            )
+            .doc(rideId)
+            .set(
+              update,
+              SetOptions(
+                merge: true,
+              ),
+            );
+      }
+    } catch (_) {
+      // ما نوقف عرض الطلب إذا فشل اسم المنطقة.
+    } finally {
+      _resolvingOfferAreas
+          .remove(rideId);
+    }
+  }
+
   void _notifyNearbyRide({
     required String rideId,
     required int fare,
@@ -11091,20 +12662,28 @@ class _DriverHomePageState
   void _startOfferTimer(
     String rideId,
   ) {
-    if (_currentOfferId == rideId &&
-        _offerTimer?.isActive == true) {
+    if (_currentOfferId ==
+            rideId &&
+        _offerTimer?.isActive ==
+            true) {
       return;
     }
 
     _offerTimer?.cancel();
 
+    if (!mounted) return;
+
     setState(() {
-      _currentOfferId = rideId;
-      _offerSeconds = 15;
+      _currentOfferId =
+          rideId;
+      _offerSeconds = 50;
     });
 
-    _offerTimer = Timer.periodic(
-      const Duration(seconds: 1),
+    _offerTimer =
+        Timer.periodic(
+      const Duration(
+        seconds: 1,
+      ),
       (timer) {
         if (!mounted) {
           timer.cancel();
@@ -11115,8 +12694,11 @@ class _DriverHomePageState
           timer.cancel();
 
           setState(() {
-            _currentOfferId = null;
-            _offerSeconds = 15;
+            _skippedOfferIds
+                .add(rideId);
+            _currentOfferId =
+                null;
+            _offerSeconds = 50;
           });
 
           return;
@@ -11127,6 +12709,21 @@ class _DriverHomePageState
         });
       },
     );
+  }
+
+  void _skipCurrentOffer(
+    String rideId,
+  ) {
+    _offerTimer?.cancel();
+
+    if (!mounted) return;
+
+    setState(() {
+      _skippedOfferIds
+          .add(rideId);
+      _currentOfferId = null;
+      _offerSeconds = 50;
+    });
   }
 
   
@@ -11350,10 +12947,6 @@ Future<void> _acceptRide(
               'driverPhone': widget.driver.phone,
               'driverProfilePhotoUrl':
                   widget.driver.profilePhotoUrl,
-              'driverTuktukNumber':
-                  widget.driver.tuktukNumber,
-              'driverTuktukColor':
-                  widget.driver.tuktukColor,
               'driverVerified':
                   widget.driver.verified,
               'driverLat': location.latitude,
@@ -11547,6 +13140,7 @@ Future<void> _acceptRide(
                       isEqualTo:
                           'searching',
                     )
+                    .limit(30)
                     .snapshots(),
                 builder: (context, snapshot) {
                   final docs =
@@ -11605,12 +13199,70 @@ Future<void> _acceptRide(
                         5000;
                   }).toList();
 
+                  available.sort(
+                    (a, b) {
+                      double distance(
+                        QueryDocumentSnapshot
+                            doc,
+                      ) {
+                        final data =
+                            doc.data()
+                                as Map<String,
+                                    dynamic>;
+
+                        if (driverLat == 0 ||
+                            driverLng == 0) {
+                          return 0;
+                        }
+
+                        return Geolocator
+                            .distanceBetween(
+                          driverLat,
+                          driverLng,
+                          doubleValue(
+                            data[
+                                'pickupLat'],
+                          ),
+                          doubleValue(
+                            data[
+                                'pickupLng'],
+                          ),
+                        );
+                      }
+
+                      return distance(a)
+                          .compareTo(
+                        distance(b),
+                      );
+                    },
+                  );
+
                   QueryDocumentSnapshot?
                       offer;
-                  if (available
-                      .isNotEmpty) {
-                    offer =
-                        available.first;
+
+                  if (_currentOfferId !=
+                      null) {
+                    for (final item
+                        in available) {
+                      if (item.id ==
+                          _currentOfferId) {
+                        offer = item;
+                        break;
+                      }
+                    }
+                  }
+
+                  if (offer == null) {
+                    for (final item
+                        in available) {
+                      if (!_skippedOfferIds
+                          .contains(
+                            item.id,
+                          )) {
+                        offer = item;
+                        break;
+                      }
+                    }
                   }
 
                   Map<String, dynamic>
@@ -11655,6 +13307,42 @@ Future<void> _acceptRide(
                       rideId: offer.id,
                       fare: fare,
                       kmAway: nearbyKm,
+                    );
+
+                    final selectedRideId =
+                        offer.id;
+
+                    final selectedRideData =
+                        Map<String,
+                            dynamic>.from(
+                      offerData,
+                    );
+
+                    WidgetsBinding
+                        .instance
+                        .addPostFrameCallback(
+                      (_) {
+                        if (!mounted) {
+                          return;
+                        }
+
+                        if (_currentOfferId !=
+                                selectedRideId ||
+                            _offerTimer
+                                    ?.isActive !=
+                                true) {
+                          _startOfferTimer(
+                            selectedRideId,
+                          );
+                        }
+
+                        unawaited(
+                          _ensureOfferAreaNames(
+                            selectedRideId,
+                            selectedRideData,
+                          ),
+                        );
+                      },
                     );
                   }
 
@@ -11716,6 +13404,17 @@ Future<void> _acceptRide(
                             ),
                           ),
                           const Spacer(),
+                          IconButton(
+                            tooltip:
+                                'دعوة الأصدقاء',
+                            onPressed:
+                                _openDriverInvites,
+                            icon:
+                                const Icon(
+                              Icons
+                                  .group_add_rounded,
+                            ),
+                          ),
                           IconButton(
                             onPressed:
                                 _openDriverNotifications,
@@ -11901,15 +13600,15 @@ Future<void> _acceptRide(
                                         const EdgeInsets
                                             .symmetric(
                                       horizontal:
-                                          9,
+                                          10,
                                       vertical:
-                                          5,
+                                          6,
                                     ),
                                     decoration:
                                         BoxDecoration(
                                       color:
                                           const Color(
-                                        0xffDDF5E7,
+                                        0xffEAF8F0,
                                       ),
                                       borderRadius:
                                           BorderRadius
@@ -11917,18 +13616,106 @@ Future<void> _acceptRide(
                                         20,
                                       ),
                                     ),
-                                    child:
-                                        Text(
+                                    child: Text(
                                       nearbyKm >
                                               0
-                                          ? '${nearbyKm.toStringAsFixed(1)} كم'
-                                          : 'قريب',
+                                          ? '${nearbyKm.toStringAsFixed(1)} كم عنك'
+                                          : 'قريب منك',
                                       style:
                                           const TextStyle(
                                         color:
                                             Color(
-                                          0xff1B8B55,
+                                          0xff16834D,
                                         ),
+                                        fontSize:
+                                            12,
+                                        fontWeight:
+                                            FontWeight
+                                                .w900,
+                                      ),
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  Container(
+                                    width: 54,
+                                    height: 54,
+                                    alignment:
+                                        Alignment
+                                            .center,
+                                    decoration:
+                                        BoxDecoration(
+                                      color:
+                                          const Color(
+                                        0xffFFF3C4,
+                                      ),
+                                      shape:
+                                          BoxShape
+                                              .circle,
+                                      border:
+                                          Border.all(
+                                        color:
+                                            const Color(
+                                          0xffFFC21A,
+                                        ),
+                                        width: 2,
+                                      ),
+                                    ),
+                                    child: Text(
+                                      '$_offerSeconds',
+                                      style:
+                                          const TextStyle(
+                                        fontSize:
+                                            18,
+                                        fontWeight:
+                                            FontWeight
+                                                .w900,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(
+                                height: 14,
+                              ),
+                              Container(
+                                width:
+                                    double.infinity,
+                                padding:
+                                    const EdgeInsets
+                                        .all(
+                                  14,
+                                ),
+                                decoration:
+                                    BoxDecoration(
+                                  color:
+                                      const Color(
+                                    0xffF7F8FA,
+                                  ),
+                                  borderRadius:
+                                      BorderRadius
+                                          .circular(
+                                    14,
+                                  ),
+                                  border:
+                                      Border.all(
+                                    color:
+                                        const Color(
+                                      0xffE6E8EC,
+                                    ),
+                                  ),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment
+                                          .start,
+                                  children: [
+                                    const Text(
+                                      'من وين إلى وين',
+                                      style:
+                                          TextStyle(
+                                        color:
+                                            Colors
+                                                .black54,
                                         fontSize:
                                             12,
                                         fontWeight:
@@ -11936,47 +13723,167 @@ Future<void> _acceptRide(
                                                 .w800,
                                       ),
                                     ),
+                                    const SizedBox(
+                                      height: 10,
+                                    ),
+                                    Text(
+                                      'من: ${stringValue(offerData['pickupArea']).trim().isNotEmpty ? stringValue(offerData['pickupArea']).trim() : compactPlaceName(stringValue(offerData['pickupAddress']))}',
+                                      maxLines:
+                                          2,
+                                      overflow:
+                                          TextOverflow
+                                              .ellipsis,
+                                      style:
+                                          const TextStyle(
+                                        fontSize:
+                                            17,
+                                        fontWeight:
+                                            FontWeight
+                                                .w900,
+                                      ),
+                                    ),
+                                    const SizedBox(
+                                      height: 8,
+                                    ),
+                                    Text(
+                                      'إلى: ${stringValue(offerData['destinationArea']).trim().isNotEmpty ? stringValue(offerData['destinationArea']).trim() : compactPlaceName(stringValue(offerData['destinationAddress']))}',
+                                      maxLines:
+                                          2,
+                                      overflow:
+                                          TextOverflow
+                                              .ellipsis,
+                                      style:
+                                          const TextStyle(
+                                        fontSize:
+                                            17,
+                                        fontWeight:
+                                            FontWeight
+                                                .w900,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(
+                                height: 12,
+                              ),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child:
+                                        Container(
+                                      padding:
+                                          const EdgeInsets
+                                              .symmetric(
+                                        vertical:
+                                            10,
+                                      ),
+                                      decoration:
+                                          BoxDecoration(
+                                        color:
+                                            const Color(
+                                          0xffFFF8DE,
+                                        ),
+                                        borderRadius:
+                                            BorderRadius
+                                                .circular(
+                                          12,
+                                        ),
+                                      ),
+                                      child:
+                                          Column(
+                                        children: [
+                                          const Text(
+                                            'الكروة',
+                                            style:
+                                                TextStyle(
+                                              color:
+                                                  Colors
+                                                      .black54,
+                                              fontSize:
+                                                  11,
+                                            ),
+                                          ),
+                                          const SizedBox(
+                                            height:
+                                                2,
+                                          ),
+                                          Text(
+                                            '$fare د.ع',
+                                            style:
+                                                const TextStyle(
+                                              fontSize:
+                                                  18,
+                                              fontWeight:
+                                                  FontWeight
+                                                      .w900,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
                                   ),
-                                  const Spacer(),
-                                  Text(
-                                    '$fare د.ع',
-                                    style:
-                                        const TextStyle(
-                                      fontSize:
-                                          17,
-                                      fontWeight:
-                                          FontWeight
-                                              .w900,
+                                  const SizedBox(
+                                    width: 10,
+                                  ),
+                                  Expanded(
+                                    child:
+                                        Container(
+                                      padding:
+                                          const EdgeInsets
+                                              .symmetric(
+                                        vertical:
+                                            10,
+                                      ),
+                                      decoration:
+                                          BoxDecoration(
+                                        color:
+                                            const Color(
+                                          0xffF2F4F7,
+                                        ),
+                                        borderRadius:
+                                            BorderRadius
+                                                .circular(
+                                          12,
+                                        ),
+                                      ),
+                                      child:
+                                          Column(
+                                        children: [
+                                          const Text(
+                                            'وقت القرار',
+                                            style:
+                                                TextStyle(
+                                              color:
+                                                  Colors
+                                                      .black54,
+                                              fontSize:
+                                                  11,
+                                            ),
+                                          ),
+                                          const SizedBox(
+                                            height:
+                                                2,
+                                          ),
+                                          Text(
+                                            '$_offerSeconds ثانية',
+                                            style:
+                                                const TextStyle(
+                                              fontSize:
+                                                  16,
+                                              fontWeight:
+                                                  FontWeight
+                                                      .w900,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ],
                               ),
                               const SizedBox(
-                                height: 12,
-                              ),
-                              _driverOfferLine(
-                                const Color(
-                                  0xff26A269,
-                                ),
-                                stringValue(
-                                  offerData[
-                                      'pickupAddress'],
-                                ),
-                              ),
-                              const SizedBox(
-                                height: 8,
-                              ),
-                              _driverOfferLine(
-                                const Color(
-                                  0xffF2673A,
-                                ),
-                                stringValue(
-                                  offerData[
-                                      'destinationAddress'],
-                                ),
-                              ),
-                              const SizedBox(
-                                height: 16,
+                                height: 14,
                               ),
                               SizedBox(
                                 width:
@@ -12058,10 +13965,9 @@ Future<void> _acceptRide(
                                     ),
                                   ),
                                   onPressed: () {
-                                    setState(() {
-                                      _currentOfferId =
-                                          null;
-                                    });
+                                    _skipCurrentOffer(
+                                      offer!.id,
+                                    );
                                   },
                                   child:
                                       const Text(
@@ -12528,6 +14434,14 @@ class _DriverActiveRidePageState
             },
           );
         },
+      );
+
+      await DriverReferralService
+          .recordCompletedRide(
+        rideId:
+            widget.rideId,
+        referredDriverId:
+            widget.driver.id,
       );
 
       await _positionSubscription?.cancel();
@@ -13236,9 +15150,17 @@ class _RideChatPageState
           .collection('messages')
           .add({
         'text': text,
-        'senderRole': widget.senderRole,
+        'senderRole':
+            widget.senderRole,
         'createdAt':
-            FieldValue.serverTimestamp(),
+            FieldValue
+                .serverTimestamp(),
+        'readByCustomer':
+            widget.senderRole !=
+                'driver',
+        'readByDriver':
+            widget.senderRole !=
+                'customer',
       });
 
       final rideSnap = await rideRef.get();
