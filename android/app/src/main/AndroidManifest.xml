@@ -3,12 +3,9 @@
     <!-- Internet -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Location -->
+    <!-- Location أثناء استخدام التطبيق -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-
-    <!-- Background location -->
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
     <!-- Foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
