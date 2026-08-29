@@ -4,12 +4,15 @@
     <item android:drawable="@android:color/white" />
 
     <item
-        android:width="220dp"
-        android:height="220dp"
+        android:width="300dp"
+        android:height="300dp"
         android:gravity="center">
+
         <bitmap
+            android:src="@drawable/tuktuk_splash_logo"
             android:gravity="center"
-            android:src="@drawable/tuktuk_splash_logo" />
+            android:filter="true" />
+
     </item>
 
 </layer-list>

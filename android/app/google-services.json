@@ -23,7 +23,45 @@
           "other_platform_oauth_client": []
         }
       }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:238089612667:android:c75decc4394156892c61de",
+        "android_client_info": {
+          "package_name": "com.example.tuktuk_manager"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDwgJIl3qBRDqbe5Kq_9TmamnnFHmCmpFA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:238089612667:android:bdbdf5c382806db12c61de",
+        "android_client_info": {
+          "package_name": "com.tuktuk.iraq"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDwgJIl3qBRDqbe5Kq_9TmamnnFHmCmpFA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
     }
   ],
   "configuration_version": "1"
-}
+}s
