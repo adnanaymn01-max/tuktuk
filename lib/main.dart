@@ -281,6 +281,8 @@ class FcmService {
     );
 
     _foregroundSub?.cancel();
+    // التطبيق المفتوح يعرض SnackBar؛ إشعار شريط النظام أثناء
+    // المقدمة يحتاج flutter_local_notifications وربط Android channel.
     _foregroundSub = FirebaseMessaging.onMessage.listen(
       (message) {
         final context = appNavigatorKey.currentContext;
@@ -866,13 +868,14 @@ class ExternalPushService {
           continue;
         }
 
-        // طلب الرحلة يروح للرمز الأحدث لهذا السائق أولاً.
-        // هذا يمنع إرسال نسخ كثيرة إلى رموز قديمة متراكمة من تثبيتات سابقة.
-        final newestToken = stringValue(data['lastFcmToken']).trim();
-        final tokens = newestToken.isNotEmpty
-            ? <String>[newestToken]
-            : _tokens(data);
-        if (tokens.isEmpty) continue;
+        // لا نعتمد حصراً على lastFcmToken: قد يكون قديماً
+        // رغم وجود توكن صالح آخر ضمن fcmTokens.
+        // دالة Supabase يجب أن تنظف توكنات UNREGISTERED من السيرفر.
+        final tokens = _tokens(data);
+        if (tokens.isEmpty) {
+          debugPrint('PUSH DRIVER: ${doc.id} has no FCM token');
+          continue;
+        }
 
         final driverLat = doubleValue(data['lat']);
         final driverLng = doubleValue(data['lng']);
@@ -893,6 +896,7 @@ class ExternalPushService {
         }
 
         candidates.add({
+          'driverId': doc.id,
           'tokens': tokens,
           'km': km,
         });
@@ -905,8 +909,10 @@ class ExternalPushService {
 
       final jobs = <Future<void>>[];
 
-      // نقلل الإزعاج: أقرب 5 سائقين فقط ياخذون Push أولي.
+      // إشعار السائقين الأقرب فقط. كل سائق يستلم أيضاً
+      // إشعاراً داخل صندوق إشعارات التطبيق.
       for (final candidate in candidates.take(5)) {
+        final driverId = candidate['driverId'] as String;
         final km = candidate['km'] as double;
         final tokens =
             (candidate['tokens'] as List).cast<String>();
@@ -914,13 +920,33 @@ class ExternalPushService {
         final distanceText = km >= 9000
             ? 'قريب منك'
             : '${km.toStringAsFixed(1)} كم';
+        final notificationBody = '$distanceText • الأجرة $fare د.ع';
+
+        // معرّف ثابت حتى لا تتكرر نفس الرسالة داخل التطبيق.
+        jobs.add(
+          FirebaseFirestore.instance
+              .collection('app_notifications')
+              .doc('new_ride_${rideId}_$driverId')
+              .set({
+            'targetType': 'driver',
+            'targetId': driverId,
+            'type': 'ride',
+            'title': 'طلب رحلة جديد 🛺',
+            'body': notificationBody,
+            'rideId': rideId,
+            'readBy': <String>[],
+            'createdAt': FieldValue.serverTimestamp(),
+          }).catchError((Object e) {
+            debugPrint('DRIVER IN-APP NOTIFICATION ERROR: $e');
+          }),
+        );
 
         for (final token in tokens) {
           jobs.add(
             _send(
               token: token,
               title: 'طلب رحلة جديد 🛺',
-              body: '$distanceText • الأجرة $fare د.ع',
+              body: notificationBody,
               data: {
                 'type': 'ride_request',
                 'rideId': rideId,
@@ -12785,7 +12811,7 @@ class DriverAccountHubPage
                   icon:
                       Icons.photo_camera_rounded,
                   title:
-                      'الصورة وكلمة السر',
+                      'الإعدادات',
                   subtitle:
                       'تغيير الصورة الشخصية وكلمة المرور',
                   onTap: () {
