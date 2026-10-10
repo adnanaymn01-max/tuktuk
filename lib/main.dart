@@ -532,29 +532,37 @@ Future<void> main() async {
   runApp(const TuktukApp());
 }
 
-Future<void> _initializeCriticalServices() async {
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+// نخلي تهيئة Supabase بفيوچر واحد حتى لا يسبقها إرسال إشعار الرحلة.
+Future<bool>? _supabaseReadyFuture;
 
-  // لا نوقف فتح التطبيق بانتظار إعدادات التسعيرة أو الإشعارات.
-  // القيم الافتراضية موجودة، وأول تحديث من Firestore يطبق تلقائياً.
-  unawaited(PricingSettingsService.start());
-  unawaited(_initializeOptionalServices());
-}
-
-Future<void> _initializeOptionalServices() async {
+Future<bool> _initializeSupabaseClient() async {
+  if (!supabaseConfigured) return false;
   try {
-    if (supabaseConfigured) {
+    if (!Supabase.instance.isInitialized) {
       await Supabase.initialize(
         url: supabaseUrl,
         anonKey: supabasePublishableKey,
       );
     }
+    return Supabase.instance.isInitialized;
   } catch (e) {
     debugPrint('SUPABASE INIT ERROR: $e');
+    return false;
   }
+}
 
+Future<void> _initializeCriticalServices() async {
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+
+  // تبدأ التهيئة مبكراً ولا تؤخر الواجهة؛ الإرسال ينتظرها عند الحاجة.
+  _supabaseReadyFuture ??= _initializeSupabaseClient();
+  unawaited(PricingSettingsService.start());
+  unawaited(_initializeOptionalServices());
+}
+
+Future<void> _initializeOptionalServices() async {
   try {
     await FcmService.initialize();
 
@@ -793,6 +801,12 @@ class ExternalPushService {
     if (!supabaseConfigured || token.trim().isEmpty) return;
 
     try {
+      // منع سباق تشغيل التطبيق: Supabase قد يكون بعده قيد التهيئة.
+      final ready = await (_supabaseReadyFuture ??= _initializeSupabaseClient());
+      if (!ready) {
+        debugPrint('PUSH SKIPPED: Supabase not initialized');
+        return;
+      }
       final response = await Supabase.instance.client.functions.invoke(
         'send-notification',
         body: {
@@ -852,7 +866,12 @@ class ExternalPushService {
           continue;
         }
 
-        final tokens = _tokens(data);
+        // طلب الرحلة يروح للرمز الأحدث لهذا السائق أولاً.
+        // هذا يمنع إرسال نسخ كثيرة إلى رموز قديمة متراكمة من تثبيتات سابقة.
+        final newestToken = stringValue(data['lastFcmToken']).trim();
+        final tokens = newestToken.isNotEmpty
+            ? <String>[newestToken]
+            : _tokens(data);
         if (tokens.isEmpty) continue;
 
         final driverLat = doubleValue(data['lat']);
@@ -14697,57 +14716,7 @@ Future<void> _acceptRide(
                           ),
                         ),
                       ],
-                      const SizedBox(
-                        height: 14,
-                      ),
-                      Container(
-                        padding:
-                            const EdgeInsets
-                                .symmetric(
-                          vertical: 18,
-                        ),
-                        decoration:
-                            BoxDecoration(
-                          color:
-                              Colors.white,
-                          borderRadius:
-                              BorderRadius
-                                  .circular(
-                            16,
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child:
-                                  _driverMiniStat(
-                                'الرحلات',
-                                '${intValue(driverData['todayRides'])}',
-                              ),
-                            ),
-                            Expanded(
-                              child:
-                                  _driverMiniStat(
-                                'كم',
-                                doubleValue(driverData['todayKm'])
-                                    .toStringAsFixed(
-                                  1,
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              child:
-                                  _driverMiniStat(
-                                'الأرباح',
-                                '${intValue(driverData['todayEarnings'])}',
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(
-                        height: 18,
-                      ),
+                      const SizedBox(height: 18),
                       const Text(
                         'طلبات قريبة',
                         style:
