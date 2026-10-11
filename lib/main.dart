@@ -540,13 +540,12 @@ Future<bool>? _supabaseReadyFuture;
 Future<bool> _initializeSupabaseClient() async {
   if (!supabaseConfigured) return false;
   try {
-    if (!Supabase.instance.isInitialized) {
-      await Supabase.initialize(
-        url: supabaseUrl,
-        anonKey: supabasePublishableKey,
-      );
-    }
-    return Supabase.instance.isInitialized;
+    // Do not access Supabase.instance before Supabase.initialize: it throws.
+    await Supabase.initialize(
+      url: supabaseUrl,
+      anonKey: supabasePublishableKey,
+    );
+    return true;
   } catch (e) {
     debugPrint('SUPABASE INIT ERROR: $e');
     return false;
@@ -806,7 +805,9 @@ class ExternalPushService {
       // منع سباق تشغيل التطبيق: Supabase قد يكون بعده قيد التهيئة.
       final ready = await (_supabaseReadyFuture ??= _initializeSupabaseClient());
       if (!ready) {
-        debugPrint('PUSH SKIPPED: Supabase not initialized');
+        // Permit a later send to retry after a transient init failure.
+        _supabaseReadyFuture = null;
+        debugPrint('PUSH SKIPPED: Supabase initialization failed; see SUPABASE INIT ERROR');
         return;
       }
       final response = await Supabase.instance.client.functions.invoke(
@@ -819,9 +820,11 @@ class ExternalPushService {
         },
       );
 
-      debugPrint(
-        'PUSH OK: ${response.status} $title',
-      );
+      if (response.status >= 200 && response.status < 300) {
+        debugPrint('PUSH ACCEPTED: ${response.status} $title');
+      } else {
+        debugPrint('PUSH FAILED: HTTP ${response.status} $title');
+      }
     } catch (e) {
       debugPrint('PUSH ERROR: $e');
     }
@@ -853,9 +856,10 @@ class ExternalPushService {
     required int fare,
   }) async {
     try {
+      // بعض حسابات السائقين القديمة ما بيها حقل active؛
+      // بقية التطبيق تعتبر غياب الحقل حساباً فعالاً.
       final snapshot = await FirebaseFirestore.instance
           .collection('drivers')
-          .where('active', isEqualTo: true)
           .get();
 
       final candidates = <Map<String, dynamic>>[];
@@ -863,8 +867,10 @@ class ExternalPushService {
       for (final doc in snapshot.docs) {
         final data = doc.data();
 
-        if (data['acceptingRides'] == false ||
-            data['online'] == false) {
+        // نطابق شرط ظهور الطلبات عند السائق:
+        // active المفقود لا يعني حساباً معطلاً.
+        if (data['active'] == false ||
+            data['acceptingRides'] == false) {
           continue;
         }
 
@@ -880,20 +886,17 @@ class ExternalPushService {
         final driverLat = doubleValue(data['lat']);
         final driverLng = doubleValue(data['lng']);
 
-        double km = 9999;
-
-        if (driverLat != 0 && driverLng != 0) {
-          km = Geolocator.distanceBetween(
-                driverLat,
-                driverLng,
-                pickupLat,
-                pickupLng,
-              ) /
-              1000;
-
-          // بالبداية ننبّه أقرب السائقين فقط.
-          if (km > 5) continue;
-        }
+        // الإشعار يروح لكل سائق قريب عنده موقع معروف وصالح.
+        // ما نرسل لسائق بدون موقع لأن ما نكدر نتحقق من قربه.
+        if (driverLat == 0 || driverLng == 0) continue;
+        final km = Geolocator.distanceBetween(
+              driverLat,
+              driverLng,
+              pickupLat,
+              pickupLng,
+            ) /
+            1000;
+        if (km > 5) continue;
 
         candidates.add({
           'driverId': doc.id,
@@ -902,6 +905,8 @@ class ExternalPushService {
         });
       }
 
+      debugPrint('PUSH DRIVER: eligible drivers within 5 km = ${candidates.length}');
+
       candidates.sort(
         (a, b) => (a['km'] as double)
             .compareTo(b['km'] as double),
@@ -909,9 +914,9 @@ class ExternalPushService {
 
       final jobs = <Future<void>>[];
 
-      // إشعار السائقين الأقرب فقط. كل سائق يستلم أيضاً
-      // إشعاراً داخل صندوق إشعارات التطبيق.
-      for (final candidate in candidates.take(5)) {
+      // إرسال إشعار لكل السائقين المتصلين ضمن 5 كم، بدون حد 5 سائقين.
+      // كل سائق يستلم أيضاً إشعاراً داخل صندوق إشعارات التطبيق.
+      for (final candidate in candidates) {
         final driverId = candidate['driverId'] as String;
         final km = candidate['km'] as double;
         final tokens =
@@ -13385,8 +13390,7 @@ class _DriverHomePageState
     _offerTimer?.cancel();
     _offerRefreshTimer?.cancel();
 
-    _goOffline();
-
+    // Keep the driver eligible for push notifications when the app closes.
     super.dispose();
   }
 
@@ -13396,10 +13400,6 @@ class _DriverHomePageState
       if (_manualOnline) {
         unawaited(_goOnline());
       }
-    } else if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.detached ||
-        state == AppLifecycleState.inactive) {
-      unawaited(_goOffline());
     }
   }
 
@@ -13411,7 +13411,7 @@ class _DriverHomePageState
           .get();
 
       final data = snap.data() ?? {};
-      final enabled = data['acceptingRides'] != false;
+      const enabled = true;
 
       if (mounted) {
         setState(() {
@@ -13423,11 +13423,7 @@ class _DriverHomePageState
         _manualOnlineLoaded = true;
       }
 
-      if (enabled) {
-        await _goOnline();
-      } else {
-        await _goOffline();
-      }
+      await _goOnline();
     } catch (_) {
       _manualOnline = true;
       _manualOnlineLoaded = true;
@@ -14094,8 +14090,7 @@ Future<void> _acceptRide(
             throw Exception('الحساب معطل');
           }
 
-          if (driverData['acceptingRides'] == false ||
-              driverData['online'] == false) {
+          if (driverData['active'] == false) {
             throw Exception(
               'فعّل حالة متصل حتى تستلم الرحلات',
             );
@@ -14358,11 +14353,7 @@ Future<void> _acceptRide(
                     driverData['lng'],
                   );
 
-                  final acceptingRides =
-                      (_manualOnlineLoaded
-                              ? _manualOnline
-                              : driverData['acceptingRides'] != false) &&
-                          driverData['online'] != false;
+                  final acceptingRides = driverData['active'] != false;
 
                   final available =
                       docs.where((doc) {
@@ -14401,25 +14392,8 @@ Future<void> _acceptRide(
                       return true;
                     }
 
-                    final createdAt =
-                        timestampToDate(
-                          data['createdAt'],
-                        ) ??
-                            DateTime.now();
-
-                    final ageSeconds =
-                        DateTime.now()
-                            .difference(createdAt)
-                            .inSeconds;
-
-                    // توزيع تدريجي: القريب جداً يشوف الطلب أولاً،
-                    // وبعدها تتوسع دائرة العرض تلقائياً.
-                    final maxMeters =
-                        ageSeconds < 20
-                            ? 2000.0
-                            : ageSeconds < 40
-                                ? 5000.0
-                                : 10000.0;
+                    // نفس نطاق الإشعارات: كل السائقين ضمن 5 كم.
+                    const maxMeters = 5000.0;
 
                     return Geolocator
                             .distanceBetween(
@@ -14590,35 +14564,6 @@ Future<void> _acceptRide(
                     children: [
                       Row(
                         children: [
-                          Switch.adaptive(
-                            value: _manualOnlineLoaded
-                                ? _manualOnline
-                                : driverData['acceptingRides'] != false,
-                            activeColor:
-                                const Color(
-                              0xff22A663,
-                            ),
-                            onChanged:
-                                (value) async {
-                              await _setManualOnline(value);
-                            },
-                          ),
-                          Text(
-                            (_manualOnlineLoaded
-                                        ? _manualOnline
-                                        : driverData['acceptingRides'] != false)
-                                ? 'متصل'
-                                : 'غير متصل',
-                            style:
-                                const TextStyle(
-                              color: Color(
-                                0xff16834D,
-                              ),
-                              fontWeight:
-                                  FontWeight
-                                      .w900,
-                            ),
-                          ),
                           const Spacer(),
                           IconButton(
                             tooltip:
